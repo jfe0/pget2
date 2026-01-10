@@ -13,8 +13,8 @@ $param_list = [
     '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
     '--reject-regex=\?|#|&|\.(?:rar|gz|zip|epub|txt|pdf|apk|deb|dmg|exe)$',
     '--directory-prefix=C:\\workspace\\crawler',
-    '--start-url=https://www.a.com/',
-    '--sub-string=<div id="Content">,<div class="box">|<p class="a">,</div>',
+    '--start-url=https://www.baidu.com/',
+    '--sub-string=<head>,<body>|</head>,</body>',
     '--store-database',
     '--utf-8',
     '--no-echo',
@@ -146,11 +146,12 @@ $param_list = [
 mb_internal_encoding('UTF-8');
 mb_http_output('UTF-8');
 if (php_sapi_name() !== 'cli') die("Only be run in CLI mode.\n"); // 检查是否在命令行模式下运行
-if (version_compare(PHP_VERSION, '8.0.0', '<')) die("PHP 8.0+ Required.\n"); // PHP版本检查
+if (version_compare(PHP_VERSION, '8.5.0', '<')) die("PHP 8.0+ Required.\n"); // PHP版本检查
 error_reporting(E_ALL & ~E_NOTICE); // 只显示除了通知之外的所有错误
-set_time_limit(0); // 设置脚本执行时间无限制
 ignore_user_abort(1); // 忽略用户断开连接，确保脚本继续执行
-ini_set('memory_limit', '4096M'); // 设置脚本可使用的最大内存为20G
+set_time_limit(0); // 延长脚本最大执行时间（单位：秒，0 表示无限制）
+ini_set('max_execution_time', 0); // 关闭 PHP 超时（部分环境需要同时设置）
+ini_set('memory_limit', '4096M'); // 设置脚本可使用的最大内存为4G
 date_default_timezone_set('Asia/Shanghai'); // 设置时区为亚洲上海
 register_shutdown_function('pget_shutdown_handler'); // 致命错误兜底
 // 中止信号兜底（windows 不支持 pcntl_signal ）
@@ -410,6 +411,7 @@ class Pget
         'sources_updates' => []   // sources表更新缓存
     ];
     private $curl_handle = null; // 浏览器句柄
+    private CurlShareHandle $curlShareHandle; // 新增：cURL 共享句柄
     // 添加回调函数属性
     private $successCallback;
     private $failureCallback;
@@ -434,6 +436,14 @@ class Pget
         } else {
             $this->link_table = new ArraySharder();
         }
+
+        // 1. 初始化 cURL 共享句柄（PHP 8.5 优化后的核心）
+        $this->curlShareHandle = curl_share_init();
+        // 2. 设置共享资源类型（DNS + SSL + COOKIE）
+        curl_share_setopt($this->curlShareHandle, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        curl_share_setopt($this->curlShareHandle, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+        curl_share_setopt($this->curlShareHandle, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
+        // （可选）PHP 8.5 新增：持久化连接池（底层优化，无需额外配置）
         // 并发句柄集
         $this->chs = curl_multi_init();
 
@@ -540,13 +550,16 @@ class Pget
         }
         // 关闭单个 curl 句柄
         if (isset($this->curl_handle) && is_resource($this->curl_handle)) {
-            curl_close($this->curl_handle);
             unset($this->curl_handle);
         }
         // 关闭并发 curl 句柄
         if (isset($this->chs) && is_resource($this->chs)) {
             curl_multi_close($this->chs);
             unset($this->chs);
+        }
+        // 销毁共享句柄
+        if (isset($this->curlShareHandle) && is_resource($this->curlShareHandle)) {
+            unset($this->curlShareHandle);
         }
         // 关闭所有并发请求中的 curl 句柄
         if (isset($this->handleMap) && $this->handleMap instanceof SplObjectStorage) {
@@ -555,7 +568,7 @@ class Pget
             while ($this->handleMap->valid()) {
                 $ch = $this->handleMap->current();
                 if (is_resource($ch)) {
-                    curl_close($ch);
+                    unset($ch);
                 }
                 $this->handleMap->next();
             }
@@ -978,7 +991,7 @@ class Pget
                 }
 
                 $pdo->beginTransaction();
-
+                $urlBuffer = [];
                 if (is_string($urls)) {
                     $urlBuffer[$urls] = $use;
                 }
@@ -1595,7 +1608,7 @@ class Pget
     //正在采集的句柄集
     private $handleMap;
     //总采集句柄
-    private $chs;
+    private CurlMultiHandle $chs;
 
     /**
      * 串行采集：GET方式
@@ -1610,14 +1623,14 @@ class Pget
     {
 
         $ch = $this->createHandle($url);
-
+        /** @var CurlHandle $ch */
         $curl_errno = curl_errno($ch);
         $curl_error = curl_error($ch);
         $http_info = curl_getinfo($ch);
         $code = $http_info['http_code'];
         $response = curl_exec($ch);
 
-        curl_close($ch);
+        unset($ch);
 
         // 请求出错或反馈内容为空
         if ($curl_errno !== 0 || $code === 403) {
@@ -1638,29 +1651,57 @@ class Pget
      * @param unknown $url 要抓取的地址
      * @return multitype:resource Ambigous
      */
-    private function createHandle($url, $method = 'GET', $postfields = [])
+    private function createHandle($url, $method = 'GET', $postfields = []): CurlHandle
     {
         // 待请求的URL要编码，curl无法处理非ASCII网址
         $url = rawurlencodex($url);
-        //构造一个句柄
-        $ch = curl_init();
+        // 1. 构造一个句柄
+        $ch = curl_init($url);
+        // 2. 绑定共享句柄到当前 cURL 句柄（核心！）
+        curl_setopt($ch, CURLOPT_SHARE, $this->curlShareHandle);
 
-        //构造配置
-        $opt = array(
-            CURLOPT_URL => $url,
-            CURLOPT_ENCODING => 'gzip, deflate',
-            CURLOPT_RETURNTRANSFER => 1, // 要求返回结果
-            CURLOPT_CONNECTTIMEOUT => 15, //连接超时
-            CURLOPT_TIMEOUT => 30, // 超时
-            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_NONE, // 自动 http 协议
-            CURLOPT_FOLLOWLOCATION => true, // 是否自动 301/302跳转
-            CURLOPT_MAXREDIRS => 5,
-            CURLOPT_USERAGENT => $this->cfg['--user-agent']
-        );
-        curl_setopt_array($ch, $opt);
+        // 解析 URL 协议（提前解析，避免后续重复操作）
+        $protocol = parse_url($url, PHP_URL_SCHEME);
+        $isHttps = strtolower($protocol) === 'https';
+
+        // ========== 基础通用配置（逐条设置，无重复） ==========
+        // 启用 gzip/deflate 压缩
+        curl_setopt($ch, CURLOPT_ENCODING, 'gzip, deflate');
+        // 要求返回结果（而非直接输出）
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        // 连接超时时间（秒）
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
+        // 整体请求超时时间（秒）
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        // HTTP 协议版本：HTTPS 会覆盖为 1.1，HTTP 保持自动
+        curl_setopt($ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_NONE);
+        // 自动跟随 301/302 跳转
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        // 最大跳转次数
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
+        // User-Agent（仅设置一次）
+        curl_setopt($ch, CURLOPT_USERAGENT, $this->cfg['--user-agent']);
+        // Referer 来源页
         curl_setopt($ch, CURLOPT_REFERER, $url);
-        if (str_starts_with($url, 'https')) {
-            // 根据配置选项决定是否验证SSL证书
+
+        // ========== 连接池复用配置（所有请求通用） ==========
+        // 关闭强制新建连接（复用连接池）
+        curl_setopt($ch, CURLOPT_FORBID_REUSE, false);
+        // 不强制新鲜连接（复用已有连接）
+        curl_setopt($ch, CURLOPT_FRESH_CONNECT, false);
+
+        // ========== HTTPS 专属配置（仅 HTTPS 生效） ==========
+        if ($isHttps) {
+            // 强制 HTTP/1.1 长连接（适配 PHP 8.5 共享句柄）
+            curl_setopt($ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+            // 开启 TCP 长连接保活
+            curl_setopt($ch, CURLOPT_TCP_KEEPALIVE, true);
+            curl_setopt($ch, CURLOPT_TCP_KEEPIDLE, 10);  // 空闲10秒发送保活包
+            curl_setopt($ch, CURLOPT_TCP_KEEPINTVL, 5);   // 保活包间隔5秒
+            // 开启 SSL 会话缓存复用
+            curl_setopt($ch, CURLOPT_SSL_SESSIONID_CACHE, true);
+
+            // SSL 证书验证（根据配置决定）
             if ($this->cfg['--no-check-certificate']) {
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
@@ -1668,7 +1709,12 @@ class Pget
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
             }
+        } else {
+            // ========== HTTP 专属配置 ==========
+            // 关闭 SSL 验证（避免 HTTP 请求触发 SSL 警告）
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         }
+
         if ($method === 'HEAD') {
             // 若为HEAD请求，只获取响应头
             curl_setopt($ch, CURLOPT_NOBODY, 1);
@@ -1799,6 +1845,7 @@ class Pget
 
         //从待处理列表中取信息到正在处理的列表中
         while (count($this->handleMap) < $this->cfg['--max-threads'] && $this->pending_queue->isEmpty() === false) {
+
             $number = $this->loop_count++;
             $url = $this->pending_queue->dequeue();
 
@@ -1833,6 +1880,7 @@ class Pget
             // 创建子句柄
             $ch = $this->createHandle($url);
             //加到总句柄中
+            /** @var CurlHandle $ch */
             curl_multi_add_handle($this->chs, $ch);
             //记录到正在处理的句柄中
             $this->handleMap[$ch] = ['url' => $url, 'is_file_exist' => $is_file_exist, 'id' => $number];
@@ -1890,6 +1938,42 @@ class Pget
         }
     }
     /**
+     * 封装 cURL 耗时统计函数（修复 SSL 复用判断的致命错误）
+     * @param CurlHandle $ch cURL 句柄
+     * @param string $url 请求的 URL
+     * @return array 统计结果
+     */
+    private function getCurlTimeStats(CurlHandle $ch, string $url): array
+    {
+        $info = curl_getinfo($ch);
+        // 第一步：兜底 $info 为数组，防止 curl_getinfo 返回 false
+        $info = is_array($info) ? $info : [];
+
+        // 第二步：所有字段先做存在性检查，赋值默认值
+        $protocol = parse_url($url, PHP_URL_SCHEME) ?: 'unknown';
+        $dnsTime = $info['namelookup_time'] ?? 0;
+        $tcpConnectTime = $info['connect_time'] ?? 0;
+        $sslHandshakeTime = $info['appconnect_time'] ?? 0; // 兼容赋值
+        $totalTime = $info['total_time'] ?? 0;
+
+        // 第三步：修复 SSL 复用判断（先检查协议+字段存在+耗时阈值）
+        $isSslReused = false;
+        if ($protocol === 'https' && isset($info['appconnect_time'])) {
+            // SSL 复用的判断：握手耗时 < 0.01 秒（复用会话），否则是新握手
+            $isSslReused = $info['appconnect_time'] < 0.01;
+        }
+
+        return [
+            'url' => $url,
+            'protocol' => $protocol,
+            'dns_time' => $dnsTime,
+            'tcp_connect_time' => $tcpConnectTime,
+            'ssl_handshake_time' => $sslHandshakeTime,
+            'total_time' => $totalTime,
+            'is_ssl_reused' => $isSslReused // 修复后：无风险
+        ];
+    }
+    /**
      * 开始并发采集：数组分片+队列模式
      */
     public function run_multicatcher()
@@ -1930,9 +2014,9 @@ class Pget
                         $this->done($done);
 
                         $ch = $done['handle'];
-                        $this->handleMap->detach($ch);
+                        $this->handleMap->offsetUnset($ch);
                         curl_multi_remove_handle($this->chs, $ch);
-                        curl_close($ch);
+                        unset($ch);
 
                         // 如果开启等待模式，则中断补充新任务，等待所有任务完成统一补充，反之则是连续补充任务，不间断执行并发
                         if (!$this->cfg['--wait']) {
@@ -2393,7 +2477,7 @@ class Pget
             $this->echo_logs($number, $url, 'Response Null');
             return;
         }
-        $local_file = $this->url_local_path($url, $this->start_info['directory_prefix']);
+        $local_file = $this->url_local_path($url, $this->dir_prefix);
         if (!$this->writeContentToFile($local_file, $response, $url, $number)) {
             return;
         }
@@ -2975,12 +3059,7 @@ class Pget
 
         // 拼接相对路径并转换为绝对路径
         $dirname = str_ends_with($url, '/') ? $url : dirname($url) . '/';
-        static $get_absolute_url_cache = [];
-        $key = $dirname . $path;
-        if (isset($get_absolute_url_cache[$key])) {
-            return $get_absolute_url_cache[$key];
-        }
-        return $get_absolute_url_cache[$key] = $this->get_standard_url($dirname . $path);
+        return $this->get_standard_url($dirname . $path);
     }
     /**
      * 绝对路径规范化
