@@ -18,6 +18,11 @@ $param_list = [
     '--store-database',
     '--utf-8',
     '--no-echo',
+    '--mysql-user=root',
+    '--mysql-password=root',
+    '--mysql-host=localhost',
+    '--mysql-port=3306',
+    '--mysql-charset=utf8mb4',
     // '--output-file=php://null',
     // '--delete-string=<head>|</head>',
     // '--pause-time=600',
@@ -29,6 +34,7 @@ $param_list = [
     // '--restrict-file-names',
     // '--adjust-extension',
     // '--output-document=output.html',
+
 ];
 
 /**
@@ -140,6 +146,10 @@ $param_list = [
  * 
  * --store-database               使用数据库存储链接和内容
  * --store-file                   默认模式，使用文件存储链接和内容
+ * --store-user                   数据库用户名
+ * --store-password               数据库密码
+ * --store-host                   数据库主机
+ * --store-charset                数据库字符集，默认utf8mb4
  * 
  */
 
@@ -240,6 +250,11 @@ class PgetConfig
         '--strip-tags-except' => '',
         '--skip-save-regex' => '',
         '--output-document' => '',
+        '--mysql-user' => 'root',
+        '--mysql-password' => 'root',
+        '--mysql-host' => 'localhost',
+        '--mysql-port' => '3306',
+        '--mysql-charset' => 'utf8mb4'
     ];
     public bool $isWindows = false;
     public bool $isChineseWindows = false;
@@ -390,7 +405,7 @@ class Pget
     public PgetConfig $config; // 爬虫配置类
     public array $cfg = []; // 配置选项
     private int $loop_count = 1; // 循环计数
-    public $link_table; // 已处理链接表：键为链接，值为布尔值（true=本地文件存在，false=不存在，null=不存在）
+    public array|ArraySharder $link_table; // 已处理链接表：键为链接，值为布尔值（true=本地文件存在，false=不存在，null=不存在）
     public SplQueue $pending_queue; // 待处理链接队列
     private $log_file_handle = null; // 日志文件句柄
     private array $filter = []; // 过滤规则
@@ -401,7 +416,6 @@ class Pget
     private array $domain_list = []; // 主机列表
     private string $db_type = 'mysql'; // 数据库类型
     private PDO $pdo; // 数据库对象
-    private $catcher; // 并发爬虫
     private int $error_count = 0; // 错误总次数
     // 添加数据库缓存池属性
     private array $db_cache = [
@@ -410,11 +424,16 @@ class Pget
         'sources_inserts' => [],  // sources表插入缓存
         'sources_updates' => []   // sources表更新缓存
     ];
-    private $curl_handle = null; // 浏览器句柄
     private CurlShareHandle $curlShareHandle; // 新增：cURL 共享句柄
     // 添加回调函数属性
     private $successCallback;
     private $failureCallback;
+
+    //正在采集的句柄集
+    private SplObjectStorage $handleMap;
+    //总采集句柄
+    private CurlMultiHandle $chs;
+
     /**
      * 构造函数，初始化配置和队列
      */
@@ -548,17 +567,13 @@ class Pget
         if (isset($this->domain_list)) {
             unset($this->domain_list);
         }
-        // 关闭单个 curl 句柄
-        if (isset($this->curl_handle) && is_resource($this->curl_handle)) {
-            unset($this->curl_handle);
-        }
         // 关闭并发 curl 句柄
-        if (isset($this->chs) && is_resource($this->chs)) {
+        if (isset($this->chs)) {
             curl_multi_close($this->chs);
             unset($this->chs);
         }
         // 销毁共享句柄
-        if (isset($this->curlShareHandle) && is_resource($this->curlShareHandle)) {
+        if (isset($this->curlShareHandle)) {
             unset($this->curlShareHandle);
         }
         // 关闭所有并发请求中的 curl 句柄
@@ -567,7 +582,7 @@ class Pget
             $this->handleMap->rewind();
             while ($this->handleMap->valid()) {
                 $ch = $this->handleMap->current();
-                if (is_resource($ch)) {
+                if (isset($ch)) {
                     unset($ch);
                 }
                 $this->handleMap->next();
@@ -612,11 +627,6 @@ class Pget
         // 检查是否提供了起始URL或输入文件，若都未提供则终止脚本
         if (!$this->cfg['--start-url'] && !$this->cfg['--input-file']) {
             $this->echo_logs('FORCEECHO', 'Error! No URL');
-            return false;
-        }
-        // 起始URL格式错误就终止脚本
-        if (!isset($this->start_info['scheme']) || !isset($this->start_info['host'])) {
-            $this->echo_logs('FORCEECHO', 'Error! Invalid URL');
             return false;
         }
 
@@ -722,7 +732,7 @@ class Pget
         if ($this->cfg['--store-database']) {
             // 创建 pdo 对象
             $db_name = 'pget_' . preg_replace('/[^a-zA-Z\d_]/', '_', $this->start_info['host']);
-            $this->pdo = new PDO("mysql:host=localhost;charset=utf8mb4", 'root', 'root');
+            $this->pdo = new PDO("mysql:host=" . $this->cfg['--mysql-host'] . ";charset=" . $this->cfg['--mysql-charset'], $this->cfg['--mysql-user'], $this->cfg['--mysql-password']);
             // 初始化数据库
             $this->db_create_db_mysql($db_name);
             // 将初始URL添加到数据库
@@ -1604,11 +1614,6 @@ class Pget
     }
 
     // ================== 并发爬虫 ==================
-
-    //正在采集的句柄集
-    private $handleMap;
-    //总采集句柄
-    private CurlMultiHandle $chs;
 
     /**
      * 串行采集：GET方式
